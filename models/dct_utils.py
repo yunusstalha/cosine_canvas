@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-modules.py  
+dct_utils.py  
 ==============================================
 Fast utility components for the FLARE implementation. All transformation matrices and the
 zig‑zag scan pattern are pre‑computed **once** during construction and
