@@ -1,2 +1,6 @@
 models/test_stuff.ipynb
-models/__pycache__/modules.cpython-310.pyc
+models/__pycache__/
+
+models/test_discrete_head.py
+models/test_gmm_head.py
+models/test_bridge.ipynb
