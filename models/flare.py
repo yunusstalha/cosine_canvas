@@ -10,9 +10,9 @@ from torch.utils.checkpoint import checkpoint
 from timm.models.vision_transformer import Block # Using ViT blocks like MAR/TokenBridge
 
 # Import inner AR heads
-from flare_heads import DiscreteARHead, GMMARHead 
+from .flare_heads import DiscreteARHead, GMMARHead 
 
-from dct_utils import FrequencyOrderer, UniformQuantizer
+from .dct_utils import FrequencyOrderer, UniformQuantizer
 
 # Placeholder for quantization range finding function
 # def find_dct_coefficient_range(dataset, vae_encoder, dct_func, num_components):
@@ -326,7 +326,7 @@ class FLARE(nn.Module):
     # --------------------------------------------------------------------------
     # MAE Decoder Forward
     # --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # MAE Decoder Forward (Updated to match TokenBridge/ARINAR)
     # --------------------------------------------------------------------------
     def forward_mae_decoder(self, x_encoded, mask):

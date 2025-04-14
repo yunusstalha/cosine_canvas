@@ -1,0 +1,13 @@
+main_cache.py
+
+torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 \
+main_cache.py \
+--img_size 256 \
+--vae_path /research/nfs_yilmaz_15/kwag/cosine_canvas/pretrained/vae/kl16.ckpt \
+--vae_embed_dim 16 \
+--batch_size 129 \
+--data_path /research/nfs_yilmaz_15/kwag/data/imagenet \
+--cached_path /research/nfs_yilmaz_15/kwag/data/imagenet/cache
+
+main.py
+
