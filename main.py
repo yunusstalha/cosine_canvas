@@ -27,8 +27,10 @@ def get_args_parser():
     parser.add_argument('--epochs', default=400, type=int)
 
     # Model parameters
-    parser.add_argument('--model', default='tokenbridge_large', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='flare_base', type=str, metavar='MODEL',
                         help='Name of model to train')
+    parser.add_argument('--head_type', default='discrete_uniform', type=str, metavar='HEAD_TYPE',
+                        help='Name of head to train')
 
     # VAE parameters
     parser.add_argument('--img_size', default=256, type=int,
@@ -57,7 +59,7 @@ def get_args_parser():
     parser.add_argument('--eval_bsz', type=int, default=64, help='generation batch size')
 
     # Quantization parameters
-    parser.add_argument('--quant_bits', default=6, type=int,
+    parser.add_argument('--num_bins', default=32, type=int,
                         help='number of bits for quantization')
     parser.add_argument('--quant_min', default=-5.0, type=float,
                         help='minimum value for quantization range')
@@ -129,6 +131,10 @@ def get_args_parser():
                         help='Use cached latents')
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
+    
+    # Teseting args TODO: delete later when sampling code is done
+    parser.add_argument('--no_eval', action='store_true', dest='no_eval',
+                        help='No evaluation is performed')
 
     return parser
 
@@ -188,21 +194,27 @@ def main(args):
         param.requires_grad = False
 
     model = flare.__dict__[args.model](
+        # --- Architecture Config ---
         img_size=args.img_size,
         vae_stride=args.vae_stride,
-        patch_size=args.patch_size,
+        attn_dropout=args.attn_dropout,
+        proj_dropout=args.proj_dropout,
+        grad_checkpointing=args.grad_checkpointing,
+        
+        # --- VAE/Input Config ---
         vae_embed_dim=args.vae_embed_dim,
-        quant_levels=2**args.quant_bits,
+        
+        # --- FLARE Specific Config ---
+        head_type=args.head_type,
+        buffer_size=args.buffer_size,
         mask_ratio_min=args.mask_ratio_min,
         label_drop_prob=args.label_drop_prob,
         class_num=args.class_num,
-        attn_dropout=args.attn_dropout,
-        proj_dropout=args.proj_dropout,
-        buffer_size=args.buffer_size,
-        grad_checkpointing=args.grad_checkpointing,
+        
+        # --- Discrete Path Config ---
+        num_bins=args.num_bins,
         quant_min=args.quant_min,
         quant_max=args.quant_max,
-        use_quantized_value=args.use_quantized_value,
     )
 
     print("Model = %s" % str(model))
@@ -282,7 +294,8 @@ def main(args):
                 'scaler': loss_scaler.state_dict()
             }, checkpoint_path)
 
-        if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
+        # TODO: delete no_eval later
+        if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs) and not args.no_eval:
             torch.cuda.empty_cache()
             eval_stats = evaluate(model_without_ddp, vae, ema_params, args, epoch, 
                       batch_size=args.eval_bsz, log_writer=log_writer,
