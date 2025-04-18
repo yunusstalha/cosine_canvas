@@ -4,3 +4,11 @@ models/__pycache__/
 models/test_discrete_head.py
 models/test_gmm_head.py
 models/test_bridge.ipynb
+models/test_flare.ipynb
+models/output_single_test/
+models/output_single_test_recon/
+pretrained_models/
+models/flare_raster.py
+models/image_overfit_test.py
+models/overfitting_test.py
+models/raster_image_overfit_test.py
