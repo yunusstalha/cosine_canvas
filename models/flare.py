@@ -5,6 +5,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import scipy.stats as stats
 from torch.utils.checkpoint import checkpoint
 from timm.models.vision_transformer import Block # Using ViT blocks like MAR/TokenBridge
@@ -13,6 +14,8 @@ from timm.models.vision_transformer import Block # Using ViT blocks like MAR/Tok
 from .flare_heads import DiscreteARHead, GMMARHead 
 
 from .dct_utils import FrequencyOrderer, UniformQuantizer
+from typing import Optional
+
 
 # Placeholder for quantization range finding function
 # def find_dct_coefficient_range(dataset, vae_encoder, dct_func, num_components):
@@ -81,7 +84,7 @@ class FLARE(nn.Module):
         self.quant_min = quant_min if head_type == "discrete_uniform" else None
         self.quant_max = quant_max if head_type == "discrete_uniform" else None
         self.grad_checkpointing = grad_checkpointing
-           
+
         # --- Calculate Sequence Length and Get Frequency Orderer for DCT---
         self.latent_h = self.latent_w = img_size // vae_stride
         self.freq_orderer = FrequencyOrderer(self.latent_h, self.latent_w)
@@ -97,7 +100,9 @@ class FLARE(nn.Module):
         # Class Embedding for CFG
         # --------------------------------------------------------------------------
         self.num_classes = class_num
-        self.class_emb = nn.Embedding(class_num, encoder_embed_dim)
+        # self.class_emb = nn.Embedding(class_num, encoder_embed_dim)
+        self.class_emb = nn.Embedding(class_num + 1, encoder_embed_dim)
+
         self.label_drop_prob = label_drop_prob
         # Fake class embedding for CFG's unconditional generation
         self.fake_latent = nn.Parameter(torch.zeros(1, encoder_embed_dim))
@@ -412,9 +417,11 @@ class FLARE(nn.Module):
 
         return decoder_out
 
-    # --------------------------------------------------------------------------
-    # Inner AR Head Loss Calculation
-    # --------------------------------------------------------------------------
+
+  
+        # --------------------------------------------------------------------------
+        # Inner AR Head Loss Calculation
+        # --------------------------------------------------------------------------
     def forward_inner_ar_loss(self, decoder_output, target_features, mask):
         """
         Calculates the loss using the appropriate inner AR head.
@@ -425,7 +432,7 @@ class FLARE(nn.Module):
         Args:
             decoder_output: Output from the decoder [B, N, D_dec]
             target_features: Ground truth features (continuous or indices) [B, N, C] or [B, N, C] (long)
-                             Shape depends on head_type.
+                            Shape depends on head_type.
             mask: Boolean mask [B, N], True indicates MASKED tokens (these are the targets)
 
         Returns:
@@ -445,16 +452,30 @@ class FLARE(nn.Module):
         masked_targets = target_features[mask]
 
         if masked_output.shape[0] == 0:
-             # Handle edge case where no tokens are masked (e.g., mask_ratio=0)
-             # Return zero loss with correct device and requires_grad status
-             return torch.tensor(0.0, device=decoder_output.device, requires_grad=True)
+            # Handle edge case where no tokens are masked (e.g., mask_ratio=0)
+            # Return zero loss with correct device and requires_grad status
+            return torch.tensor(0.0, device=decoder_output.device, requires_grad=True)
 
-        # Pass to the appropriate inner head's loss function
-        # Both DiscreteARHead and GMMARHead expect conditioning [*, D_cond] and targets [*, C]
-        loss = self.inner_ar_head.forward(
-            conditioning=masked_output, # [num_masked_total, D_dec]
-            targets=masked_targets      # [num_masked_total, C] (indices for Discrete, floats for GMM)
-        )
+        if self.head_type == "discrete_uniform":
+            # DiscreteARHead.forward expects 'conditions' and 'feature_targets', returns logits
+            # It also has an optional 'mask' argument for batch filtering, which we don't need here
+            # as we have already filtered the batch items via mask_bool selection.
+            predicted_logits = self.inner_ar_head(
+                conditions=masked_output,        # Correct name
+                feature_targets=masked_targets  # Correct name
+                # mask=None (default)
+            )
+            loss = F.cross_entropy(
+                predicted_logits.reshape(-1, self.num_bins), # Note: num_bins needs to be accessible (e.g., self.num_bins)
+                masked_targets.reshape(-1) # Target indices should already be long
+            )
+        elif self.head_type == "gmm":
+                # GMMARHead.forward expects 'conditions' and 'feature_targets', returns NLL loss directly
+                loss = self.inner_ar_head(
+                    conditions=masked_output,
+                    feature_targets=masked_targets # GMM expects float targets here
+                    # mask=None (default)
+                )
         return loss
 
     # --------------------------------------------------------------------------
@@ -533,10 +554,196 @@ class FLARE(nn.Module):
         loss = self.forward_inner_ar_loss(decoder_output, target_features, mask_bool)
 
         return loss
+    def mask_by_order(self, num_masked: int, orders: torch.Tensor, bsz: int, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Creates a boolean mask based on orders.
+        Marks the first 'num_masked' elements according to 'orders' as True (masked/unknown).
 
-    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0):
-        # TODO: Implement sampling logic (adapting MAR's iterative generation)
-        raise NotImplementedError
+        Args:
+            num_masked: Target number of tokens to be masked (True).
+            orders: Permutation orders [B, N].
+            bsz: Batch size.
+            seq_len: Sequence length N.
+            device: Torch device.
+
+        Returns:
+            Boolean mask [B, N] where True indicates masked.
+        """
+        num_masked = max(0, min(seq_len, int(num_masked))) # Clamp to [0, N]
+
+        mask = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device) # Initialize mask to False (known)
+        # Select the indices that should be masked based on the random order
+        indices_to_mask = orders[:, :num_masked] # Shape [B, num_masked]
+
+        if indices_to_mask.numel() > 0: # Check if there's anything to mask
+            # Use scatter_ to mark these positions as True (masked)
+            mask.scatter_(dim=1, index=indices_to_mask, value=True)
+
+        return mask # True means masked/unknown
+    @torch.no_grad()
+    def sample_tokens(self,
+                      bsz: int,
+                      num_iter: int = 16, # Number of decoding steps (like MAR)
+                      cfg_scale: float = 1.0,
+                      cfg_schedule="linear", # Or "constant"
+                      labels: Optional[torch.Tensor] = None,
+                      temperature: float = 1.0,
+                      top_k: Optional[int] = None, # Optional top-k for discrete head
+                      progress: bool = False # Optional progress bar
+                     ):
+        """
+        Iterative sampling using the MAE backbone and inner AR head, with CFG.
+        Adapts MAR/MaskGIT iterative decoding for FLARE's frequency sequence.
+
+        Args:
+            bsz: Batch size.
+            num_iter: Number of iterative decoding steps.
+            cfg_scale: Classifier-Free Guidance scale. If <= 1.0, disabled.
+            cfg_schedule: How CFG scale changes over iterations ('linear' or 'constant').
+            labels: Optional class labels [B]. If None, unconditional generation forced.
+            temperature: Sampling temperature for inner head (GMM stddev scale / softmax temp).
+            top_k: Optional top-k sampling for discrete head logits. Not implemented in DiscreteARHead.sample yet.
+            progress: Show tqdm progress bar.
+
+        Returns:
+            Generated sequence of continuous DCT coefficients [B, N, C].
+        """
+        self.eval() # Set model to evaluation mode
+        device = self.encoder_pos_embed_learned.device # Get device from a parameter
+        N = self.num_freq_components # H*W
+        C = self.vae_embed_dim
+        D_dec = self.decoder_embed.out_features # Decoder dimension
+
+        # --- 1. Prepare Class Embeddings for CFG ---
+        if labels is None:
+            print("Warning: No labels provided for sampling, forcing unconditional generation (cfg_scale=1.0)")
+            labels = torch.randint(0, self.num_classes, (bsz,), device=device) # Dummy labels for shape
+            cfg_scale = 1.0 # Force disable CFG
+
+        cond_emb = self.class_emb(labels).to(device=device, dtype=self.z_proj.weight.dtype) # [B, D_enc]
+
+        if cfg_scale > 1.0:
+            # Use the dedicated unconditional index (num_classes)
+            uncond_labels = torch.full_like(labels, self.num_classes)
+            uncond_emb = self.class_emb(uncond_labels).to(device=device, dtype=cond_emb.dtype) # [B, D_enc]
+            # Duplicate batch for CFG
+            batch_emb = torch.cat([cond_emb, uncond_emb], dim=0) # [2*B, D_enc]
+            eff_bsz = 2 * bsz
+        else:
+            batch_emb = cond_emb # [B, D_enc]
+            eff_bsz = bsz
+
+        # --- 2. Initialization ---
+        # Sample random orders for masking schedule
+        orders = self.sample_orders(bsz).to(device) # [B, N]
+        if cfg_scale > 1.0:
+            orders = torch.cat([orders, orders], dim=0) # Duplicate for CFG batch
+
+        # Start with all tokens masked (True = unknown/masked)
+        current_mask = torch.ones(eff_bsz, N, dtype=torch.bool, device=device)
+
+        # Initialize sequence guess (continuous values)
+        current_seq_guess = torch.zeros(eff_bsz, N, C, device=device, dtype=batch_emb.dtype)
+
+        # --- 3. Iterative Decoding Loop ---
+        iter_range = tqdm(range(num_iter), desc="FLARE Sampling") if progress else range(num_iter)
+        for step in iter_range:
+            # Duplicate state for CFG *if* needed (only input guess needed duplication inside loop)
+            if cfg_scale > 1.0 and current_seq_guess.shape[0] == bsz:
+                 # If first CFG step or state got reduced somehow, duplicate
+                 current_seq_guess = torch.cat([current_seq_guess, current_seq_guess.clone()], dim=0)
+                 current_mask = torch.cat([current_mask[:bsz], current_mask[:bsz].clone()], dim=0) # Ensure mask matches eff_bsz
+
+            # --- a. Run MAE Encoder-Decoder ---
+            # Input is always continuous guess
+            x_encoded = self.forward_mae_encoder(current_seq_guess, current_mask, batch_emb)
+            decoder_output = self.forward_mae_decoder(x_encoded, current_mask) # [eff_bsz, N, D_dec]
+
+            # --- b. Apply CFG ---
+            if cfg_scale > 1.0:
+                cond_out, uncond_out = decoder_output.chunk(2, dim=0)
+                # Calculate CFG scale for this step
+                if cfg_schedule == "linear":
+                     # Linear decay from cfg to 1.0 (borrowed from MAR/ARINAR logic)
+                     # This depends on number of *masked* tokens, let's use step directly for simplicity
+                     # Alternative: decay based on mask ratio
+                     # ratio_known = 1.0 - (current_mask[:bsz].sum() / N).item() # Approx fraction known
+                     # cfg_iter = 1 + (cfg_scale - 1) * (1.0 - ratio_known)
+                     cfg_iter = 1 + (cfg_scale - 1) * (1.0 - (step + 1) / num_iter) # Linear decay based on step
+                else: # constant
+                     cfg_iter = cfg_scale
+                eff_decoder_output = uncond_out + cfg_iter * (cond_out - uncond_out) # [B, N, D_dec]
+                current_mask_cond = current_mask[bsz:].clone() # Use mask from conditional part [B, N]
+            else:
+                eff_decoder_output = decoder_output # [B, N, D_dec]
+                current_mask_cond = current_mask.clone() # [B, N]
+
+            # --- c. Determine Mask for Next Step & Tokens to Predict ---
+            # Cosine schedule for masking ratio (fraction of tokens to keep masked)
+            mask_ratio_next = np.cos(math.pi / 2. * (step + 1) / num_iter)
+            num_masked_target = math.ceil(N * mask_ratio_next)
+
+            # Get mask for the *next* iteration
+            mask_next = self.mask_by_order(num_masked_target, orders[:bsz], bsz, N, device) # [B, N]
+
+            # Determine which tokens to predict *now*
+            if step == num_iter - 1:
+                 # Predict all remaining masked tokens in the last step
+                 mask_to_pred = current_mask_cond # [B, N]
+            else:
+                 # Predict tokens that are masked now but known in the next step
+                 mask_to_pred = torch.logical_xor(current_mask_cond, mask_next) # [B, N]
+
+            # Find indices of tokens to predict
+            masked_indices = mask_to_pred.nonzero(as_tuple=False) # [NumPredTotal, 2] -> [batch_idx, seq_idx_k]
+
+            if masked_indices.shape[0] == 0:
+                 if progress: iter_range.set_postfix({"status": "All tokens predicted"})
+                 # print(f"Step {step}: No tokens left to predict.")
+                 break # Nothing left to predict
+
+            # --- d. Sample New Tokens using Inner Head ---
+            # Select the conditioning vectors (z_k) for the tokens to predict
+            masked_conditions = eff_decoder_output[masked_indices[:, 0], masked_indices[:, 1]] # [NumPredTotal, D_dec]
+
+            # Call the inner head's sample method
+            # It handles the channel-wise AR loop internally
+            # TODO: Add top_k to DiscreteARHead.sample if needed
+            new_token_values = self.inner_ar_head.sample(
+                conditions=masked_conditions,
+                temperature=temperature
+            ) # Shape [NumPredTotal, C] (Indices for discrete, Floats for GMM)
+            # --- e. Update Sequence Guess and Mask ---
+            # Prepare continuous values to update the guess
+            if self.head_type == "discrete_uniform":
+                if not hasattr(self, 'quantizer') or self.quantizer is None:
+                     raise RuntimeError("FLARE discrete model must have a quantizer initialized for sampling.")
+                # Dequantize the sampled indices
+                self.quantizer = self.quantizer.to(device) # Ensure device
+                new_token_values_continuous = self.quantizer.dequantise(new_token_values) # [NumPredTotal, C]
+            else: # GMM head already outputs continuous values
+                new_token_values_continuous = new_token_values # [NumPredTotal, C]
+
+            # Update the *conditional* part of the sequence guess
+            # Make a copy to avoid in-place modification issues if needed later
+            updated_seq_guess_cond = current_seq_guess[:bsz].clone()
+            updated_seq_guess_cond[masked_indices[:, 0], masked_indices[:, 1]] = new_token_values_continuous.to(updated_seq_guess_cond.dtype)
+
+            # Update main sequence guess (only need conditional part for next input)
+            current_seq_guess = updated_seq_guess_cond # Shape [B, N, C]
+
+            # Update the mask for the next iteration
+            current_mask = mask_next # Shape [B, N]
+            # No need to duplicate mask here, will be handled at start of next loop if cfg > 1.0
+
+            if progress: iter_range.set_postfix({"masked_next": num_masked_target})
+
+
+        # --- 4. Final Output ---
+        final_sequence = current_seq_guess[:bsz].clone() # Ensure we only return the conditional batch part [B, N, C]
+        self.train() # Set model back to training mode
+        return final_sequence
+
 
 # --- Factory functions (optional, similar to MAR) ---
 def flare_base(**kwargs):
