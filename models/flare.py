@@ -12,8 +12,8 @@ from timm.models.vision_transformer import Block # Using ViT blocks like MAR/Tok
 
 # Import inner AR heads
 from .flare_heads import DiscreteARHead, GMMARHead 
-
 from .dct_utils import FrequencyOrderer, UniformQuantizer
+
 from typing import Optional
 
 

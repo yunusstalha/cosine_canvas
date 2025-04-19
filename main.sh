@@ -1,0 +1,10 @@
+torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=29500 \
+main.py \
+--img_size 256 \
+--vae_path /research/nfs_yilmaz_15/kwag/cosine_canvas/pretrained/vae/kl16.ckpt \
+--vae_embed_dim 16 --vae_stride 16 \
+--model flare_base --num_bins 32 --quant_min -5.0 --quant_max 5.0 \
+--epochs 400 --warmup_epochs 100 --batch_size 85 --blr 5.0e-5 \
+--output_dir work_dir/exp1 \
+--data_path /research/nfs_yilmaz_15/kwag/data/imagenet \
+--use_cache --cached_path /research/nfs_yilmaz_15/kwag/data/imagenet/cache

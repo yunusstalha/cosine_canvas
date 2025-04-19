@@ -131,10 +131,6 @@ def get_args_parser():
                         help='Use cached latents')
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
-    
-    # Teseting args TODO: delete later when sampling code is done
-    parser.add_argument('--no_eval', action='store_true', dest='no_eval',
-                        help='No evaluation is performed')
 
     return parser
 
@@ -294,8 +290,7 @@ def main(args):
                 'scaler': loss_scaler.state_dict()
             }, checkpoint_path)
 
-        # TODO: delete no_eval later
-        if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs) and not args.no_eval:
+        if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             eval_stats = evaluate(model_without_ddp, vae, ema_params, args, epoch, 
                       batch_size=args.eval_bsz, log_writer=log_writer,

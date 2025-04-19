@@ -188,6 +188,7 @@ models/image_overfit_test.py
 models/overfitting_test.py
 models/raster_image_overfit_test.py
 
+models/overfit.py
 *.ckpt
 src/
 test_forward.ipynb
